@@ -38,6 +38,8 @@ class Config(object):
     deflate = False
     use_directory = False
     blob_directory = 'blob_directory.txt'
+    blob_prefix = ''
+    blob_prefix_length = 0
 
     acl_public = None
     acl_grants = []

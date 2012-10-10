@@ -284,6 +284,23 @@ def fetch_local_list(args, recursive=None):
     return local_list, is_single_file
 
 
+
+def fetch_remote_list_worker():
+    while True:
+        try:
+            (uri, seq, out_queue) = in_queue.get_nowait()
+        except Queue.Empty:
+            return
+        try:
+            object_list = _get_filelist_remote(uri)
+            out_queue.put([uri, seq, object_list])
+        except Exception, e:
+            report_exception(e)
+            exit
+        in_queue.task_done()
+
+
+
 def fetch_remote_list(args, require_attribs=False, recursive=None):
     remote_uris = []
     remote_list = SortedDict(ignore_case=False)
@@ -294,55 +311,103 @@ def fetch_remote_list(args, require_attribs=False, recursive=None):
     if recursive == None:
         recursive = cfg.recursive
 
-    for arg in args:
-        uri = S3Uri(arg)
-        if not uri.type == 's3':
-            raise ParameterError("Expecting S3 URI instead of '%s'" % arg)
-        remote_uris.append(uri)
+    if cfg.blob_prefix_length > 0:
+        ##
+           #Disabling progress metter for parallel downloads.
+        cfg.progress_meter = False
+        #Initialize Queue
 
-    if recursive:
-        for uri in remote_uris:
-            objectlist = _get_filelist_remote(uri)
-            for key in objectlist:
-                remote_list[key] = objectlist[key]
+        #Doing this before workers would collide
+        global in_queue
+        in_queue = Queue.Queue()
+        out_queue = Queue.Queue()
+
+        blob_prefix_max = pow(16,cfg.blob_prefix_length)
+
+        for i in range(blob_prefix_max):
+            prefix = hex(i)[2:]
+
+            for arg in args:
+                prefix_uri = S3Uri(arg+prefix+"/")
+                if not prefix_uri.type == 's3':
+                    raise ParameterError("Expecting S3 URI instead of '%s'" % prefix_uri)
+
+                in_queue.put([prefix_uri, i, out_queue])
+
+        for i in range(cfg.workers):
+            t = threading.Thread(target=fetch_remote_list_worker)
+            t.daemon = True
+            t.start()
+
+        #Necessary to ensure KeyboardInterrupt can actually kill
+        #Otherwise Queue.join() blocks until all queue elements have completed
+        while threading.activeCount() > 1:
+            time.sleep(.1)
+
+        in_queue.join()
+
+        while True:
+            try:
+                (uri, seq, object_list) = out_queue.get_nowait()
+                for key in object_list:
+                    remote_list[key] = object_list[key]
+            except Queue.Empty:
+                info(u"Merged results")
+                break
+
+
     else:
-        for uri in remote_uris:
-            uri_str = str(uri)
-            ## Wildcards used in remote URI?
-            ## If yes we'll need a bucket listing...
-            if uri_str.find('*') > -1 or uri_str.find('?') > -1:
-                first_wildcard = uri_str.find('*')
-                first_questionmark = uri_str.find('?')
-                if first_questionmark > -1 and first_questionmark < first_wildcard:
-                    first_wildcard = first_questionmark
-                prefix = uri_str[:first_wildcard]
-                rest = uri_str[first_wildcard + 1:]
-                ## Only request recursive listing if the 'rest' of the URI,
-                ## i.e. the part after first wildcard, contains '/'
-                need_recursion = rest.find('/') > -1
-                objectlist = _get_filelist_remote(S3Uri(prefix), recursive=need_recursion)
+        for arg in args:
+            uri = S3Uri(arg)
+            if not uri.type == 's3':
+                raise ParameterError("Expecting S3 URI instead of '%s'" % arg)
+            remote_uris.append(uri)
+
+
+        if recursive:
+            for uri in remote_uris:
+                objectlist = _get_filelist_remote(uri)
                 for key in objectlist:
-                    ## Check whether the 'key' matches the requested wildcards
-                    if glob.fnmatch.fnmatch(objectlist[key]['object_uri_str'], uri_str):
-                        remote_list[key] = objectlist[key]
-            else:
-                ## No wildcards - simply append the given URI to the list
-                key = os.path.basename(uri.object())
-                if not key:
-                    raise ParameterError(u"Expecting S3 URI with a filename or --recursive: %s" % uri.uri())
-                remote_item = {
-                    'base_uri': uri,
-                    'object_uri_str': unicode(uri),
-                    'object_key': uri.object()
-                }
-                if require_attribs:
-                    response = S3(cfg).object_info(uri)
-                    remote_item.update({
-                        'size': int(response['headers']['content-length']),
-                        'md5': response['headers']['etag'].strip('"\''),
-                        'timestamp': Utils.dateRFC822toUnix(response['headers']['date'])
-                    })
-                remote_list[key] = remote_item
+                    remote_list[key] = objectlist[key]
+        else:
+            for uri in remote_uris:
+                uri_str = str(uri)
+                ## Wildcards used in remote URI?
+                ## If yes we'll need a bucket listing...
+                if uri_str.find('*') > -1 or uri_str.find('?') > -1:
+                    first_wildcard = uri_str.find('*')
+                    first_questionmark = uri_str.find('?')
+                    if first_questionmark > -1 and first_questionmark < first_wildcard:
+                        first_wildcard = first_questionmark
+                    prefix = uri_str[:first_wildcard]
+                    rest = uri_str[first_wildcard + 1:]
+                    ## Only request recursive listing if the 'rest' of the URI,
+                    ## i.e. the part after first wildcard, contains '/'
+                    need_recursion = rest.find('/') > -1
+                    objectlist = _get_filelist_remote(S3Uri(prefix), recursive=need_recursion)
+                    for key in objectlist:
+                        ## Check whether the 'key' matches the requested wildcards
+                        if glob.fnmatch.fnmatch(objectlist[key]['object_uri_str'], uri_str):
+                            remote_list[key] = objectlist[key]
+                else:
+                    ## No wildcards - simply append the given URI to the list
+                    key = os.path.basename(uri.object())
+                    if not key:
+                        raise ParameterError(u"Expecting S3 URI with a filename or --recursive: %s" % uri.uri())
+                    remote_item = {
+                        'base_uri': uri,
+                        'object_uri_str': unicode(uri),
+                        'object_key': uri.object()
+                    }
+                    if require_attribs:
+                        response = S3(cfg).object_info(uri)
+                        remote_item.update({
+                            'size': int(response['headers']['content-length']),
+                            'md5': response['headers']['etag'].strip('"\''),
+                            'timestamp': Utils.dateRFC822toUnix(response['headers']['date'])
+                        })
+                    remote_list[key] = remote_item
+
     return remote_list
 
 
@@ -1891,13 +1956,22 @@ def process_patterns(patterns_list, patterns_from, is_glob, option_txt=""):
 #==============================================================================================================================
 
 def cmd_upload(args):
+    cmd_upload_prefix(args, cfg.blob_prefix)
+
+
+
+def cmd_upload_prefix(args, blob_prefix):
     if (len(args) < 2):
         raise ParameterError("Too few parameters! Expected: %s" % commands['foo']['param'])
     if len(args) == 0:
         raise ParameterError("Nothing to upload. Expecting a local file or directory and a S3 URI destination.")
 
     ## Normalize URI to convert s3://bkt to s3://bkt/ (trailing slash)
-    destination_base_uri = S3Uri(args.pop())
+    destination_base_uri_arg = args.pop()
+    if blob_prefix:
+        destination_base_uri_arg = destination_base_uri_arg + "/" + blob_prefix + "/";
+
+    destination_base_uri = S3Uri(destination_base_uri_arg)
     if destination_base_uri.type != 's3':
         raise ParameterError("Destination must be S3Uri. Got: %s" % destination_base_uri)
     destination_base = str(destination_base_uri)
@@ -2016,6 +2090,12 @@ def calc_upload_remote_uris(item):
             return uri, "", False
 
     sha1 = hash_file_sha1(item['full_name_unicode'])
+
+    if cfg.blob_prefix:
+        if not sha1.startswith(cfg.blob_prefix):
+            return "","",False
+
+
     #    destination_base = item['destination_base']
     uri1 = u"sha1_%s.blob" % sha1
     uri2 = u"sha1_%s.blob__%s" % (sha1, item['file_name_extension'])
@@ -2044,7 +2124,12 @@ def do_upload_put(item, seq, total, work_info, uri):
     #        output('key: %s' % key)
 
     destination_base = item['destination_base']
-    full_uri = unicodise(destination_base + uri)
+    if cfg.blob_prefix_length > 0:
+        prefix = uri[5:(5+cfg.blob_prefix_length)]+"/"
+        full_uri = unicodise(destination_base + prefix + uri)
+    else:
+        full_uri = unicodise(destination_base + uri)
+
     item['remote_uri'] = full_uri
     if remote_list.has_key(uri):
         remote_file = remote_list[uri]
@@ -2064,9 +2149,14 @@ def do_upload_deflate(item, seq, total, work_info, uri):
     size = item['size']
     filename = item['full_name_unicode']
 
-    if size <= CONST_sharef_size:
-        info(u"Skipped %s with size %d" % (filename, size))
-        return False
+#    if size <= CONST_sharef_size:
+#        uri, is_sharef = calc_inflate_remote_uri(item)
+#        if is_sharef:
+#            info(u"Skipped sharef file %s with size %d and sharef %s" % (filename, size, uri))
+#            return uri, "", False
+#
+#        info(u"Skipped %s with size %d" % (filename, size))
+#        return False
 
 
     #MLF:Need to detach a possible simlink
@@ -2082,14 +2172,18 @@ def do_upload_deflate(item, seq, total, work_info, uri):
 def do_copy_deflate_into(item, seq, total, work_info, uri, destfilename):
     dir = os.path.dirname(destfilename)
     if not os.path.exists(dir):
-        os.makedirs(dir)
+        try:
+            os.makedirs(dir)
+        except OSError, e:
+            warning(u"Path creation collision for %s" % dir )
 
     size = item['size']
     filename = item['full_name_unicode']
 
-    if size <= CONST_sharef_size:
-        info(u"Skipped %s with size %d" % (filename, size))
-        return False
+    #Don't skip even suspicious items.... we need a copy
+#    if size <= CONST_sharef_size:
+#        info(u"Skipped %s with size %d" % (filename, size))
+#        return False
 
 
     #MLF:Need to detach a possible simlink
@@ -2124,6 +2218,7 @@ def do_upload_work(item, seq, total, work_info):
 
         do_upload_put(item, seq, total, work_info, uri1)
         do_upload_put(item, seq, total, work_info, uri2)
+
         if cfg.deflate:
             do_upload_deflate(item, seq, total, work_info, uri1)
 
@@ -2144,7 +2239,12 @@ def cmd_inflate(args):
         raise ParameterError("Nothing to inflate. Expecting a local file or directory and a S3 URI destination.")
 
     ## Normalize URI to convert s3://bkt to s3://bkt/ (trailing slash)
-    destination_base_uri = S3Uri(args.pop())
+    destination_base_uri_arg = args.pop()
+    if cfg.blob_prefix:
+        destination_base_uri_arg = destination_base_uri_arg + "/" + cfg.blob_prefix + "/";
+
+    destination_base_uri = S3Uri(destination_base_uri_arg)
+
     if destination_base_uri.type != 's3':
         raise ParameterError("Source must currently be an S3Uri. Got: %s" % destination_base_uri)
     destination_base = str(destination_base_uri)
@@ -2251,8 +2351,13 @@ def calc_inflate_remote_uri(item):
     m = re.search('^sha1_([0-9a-fA-F]+).blob$', content)
 
     if m is None:
-        info(u"Skipped %s with content %s" % (filename, content))
+        info(u"Skipped %s with content that doesn't match blob pattern" % filename)
         return "", False
+
+    if cfg.blob_prefix:
+        if not content.startswith("sha1_"+cfg.blob_prefix):
+            info(u"Skipped %s with content that doesn't match deflate_prefix %s" % (filename, cfg.blob_prefix) )
+            return "", False
 
     #    output(u"Blob-reference %s with content %s" % (filename, content))
 
@@ -2273,7 +2378,12 @@ def do_inflate_download(item, seq, total, work_info, uri):
 
     destination_base = item['destination_base']
 
-    full_uri = unicodise(destination_base + uri)
+    if cfg.blob_prefix_length > 0:
+        prefix = uri[5:(5+cfg.blob_prefix_length)]+"/"
+        full_uri = unicodise(destination_base + prefix + uri)
+    else:
+        full_uri = unicodise(destination_base + uri)
+
     item['remote_uri'] = full_uri
     item['local_filename'] = item['full_name_unicode']
     item['object_uri_str'] = item['remote_uri']
@@ -2341,7 +2451,12 @@ def cmd_copydeflate(args):
         raise ParameterError("Nothing to upload. Expecting a local file or directory and a S3 URI destination.")
 
     ## Normalize URI to convert s3://bkt to s3://bkt/ (trailing slash)
-    destination_base_uri = S3Uri(args.pop())
+    destination_base_uri_arg = args.pop()
+    if cfg.blob_prefix:
+        destination_base_uri_arg = destination_base_uri_arg + "/" + cfg.blob_prefix + "/";
+
+    destination_base_uri = S3Uri(destination_base_uri_arg)
+
     if destination_base_uri.type != 's3':
         raise ParameterError("Destination must be S3Uri. Got: %s" % destination_base_uri)
     destination_base = str(destination_base_uri)
@@ -2503,7 +2618,12 @@ def copydeflate_worker2():
 def do_linkorcopy_from_to(source_filename, dest_filename):
     dir = os.path.dirname(dest_filename)
     if not os.path.exists(dir):
-        os.makedirs(dir)
+        try:
+            os.makedirs(dir)
+        except OSError, e:
+            warning(u"Path creation collision for %s" % dir )
+
+
     if cfg.can_link:
         try:
             os.remove(dest_filename)
@@ -2518,7 +2638,11 @@ def do_linkorcopy_from_to(source_filename, dest_filename):
 def do_copy_from_to(source_filename, dest_filename):
     dir = os.path.dirname(dest_filename)
     if not os.path.exists(dir):
-        os.makedirs(dir)
+        try:
+            os.makedirs(dir)
+        except OSError, e:
+            warning(u"Path creation collision for %s" % dir )
+
 
     shutil.copyfile(source_filename, dest_filename)
 
@@ -2617,7 +2741,12 @@ def cmd_manifest(args):
         raise ParameterError("Nothing to manifest. Expecting a local file or directory and a S3 URI for additional information.")
 
     ## Normalize URI to convert s3://bkt to s3://bkt/ (trailing slash)
-    destination_base_uri = S3Uri(args.pop())
+    destination_base_uri_arg = args.pop()
+    if cfg.blob_prefix:
+        destination_base_uri_arg = destination_base_uri_arg + "/" + cfg.blob_prefix + "/";
+
+    destination_base_uri = S3Uri(destination_base_uri_arg)
+
     if destination_base_uri.type != 's3':
         raise ParameterError("Source must currently be an S3Uri. Got: %s" % destination_base_uri)
     destination_base = str(destination_base_uri)
@@ -2730,6 +2859,7 @@ def calc_manifest_info(item, work_info):
 
     remote_list = work_info['remote_list']
 
+    #MLF:TODO
     #MLF:Temporarily can be either full or suffix key
     full_uri = item['destination_base'] + uri
     if remote_list.has_key(uri):
@@ -2778,7 +2908,12 @@ def cmd_cleanup(args):
         raise ParameterError("Too few parameters! Expected: %s" % commands['cleanup']['param'])
 
     ## Normalize URI to convert s3://bkt to s3://bkt/ (trailing slash)
-    destination_base_uri = S3Uri(args.pop())
+    destination_base_uri_arg = args.pop()
+    if cfg.blob_prefix:
+        destination_base_uri_arg = destination_base_uri_arg + "/" + cfg.blob_prefix + "/";
+
+    destination_base_uri = S3Uri(destination_base_uri_arg)
+
     if destination_base_uri.type != 's3':
         raise ParameterError("Source must currently be an S3Uri. Got: %s" % destination_base_uri)
     destination_base = str(destination_base_uri)
@@ -3032,6 +3167,11 @@ def main():
         help="Read from a directory-file (named 'blob_directory.txt' unless overridden below)")
     optparser.add_option("--directory-name", dest="blob_directory", #action="append", metavar="FILE",
         help="Set the directory-file's name to FILE")
+    optparser.add_option("--blob-prefix-filter", dest="blob_prefix",
+        help="Set the prefix-filter for the blobs to be inflated/deflated (e.g. 'a') ")
+    optparser.add_option("--blob-prefix-length", dest="blob_prefix_length",
+        help="The number of digits to use as a directory prefix for content/blob-based addressing")
+
 
     optparser.add_option("-P", "--acl-public", dest="acl_public", action="store_true",
         help="Store objects with ACL allowing read for anyone.")
