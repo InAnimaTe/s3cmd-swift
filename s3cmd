@@ -1062,7 +1062,7 @@ def _compare_filelists(src_list, dst_list, src_is_local_and_dst_is_remote, src_a
                     u"XFER: %s (size mismatch: src=%s dst=%s)" % (file, src_list[file]['size'], dst_list[file]['size']))
                 attribs_match = False
 
-            if attribs_match and 'md5' in cfg.sync_checks:
+            if attribs_match and 'md5' in cfg.sync_checks and not cfg.no_check_md5:
                 ## ... same size, check MD5
                 if src_and_dst_remote:
                     src_md5 = src_list[file]['md5']
@@ -3270,6 +3270,8 @@ def main():
         help="Number of retry before failing GET or PUT.")
     optparser.add_option("--retry-delay", dest="retry_delay", type="int", action="store", default=3,
         help="Time delay to wait after failing GET or PUT.")
+    optparser.add_option("--no-check-md5", dest="no_check_md5", action="store_false",
+        help="Skip md5 integrity check when using sync.")
 
     optparser.set_usage(optparser.usage + " COMMAND [parameters]")
     optparser.set_description('S3cmd is a tool for managing objects in ' +

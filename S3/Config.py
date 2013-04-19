@@ -71,6 +71,7 @@ class Config(object):
     default_mime_type = "binary/octet-stream"
     guess_mime_type = True
     # List of checks to be performed for 'sync'
+    no_check_md5 = False
     sync_checks = ['size', 'md5']    # 'weak-timestamp'
     # List of compiled REGEXPs
     exclude = []
