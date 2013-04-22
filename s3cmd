@@ -1300,6 +1300,11 @@ def do_remote2local_work(item, seq, total):
     s3 = S3(Config())
     uri = S3Uri(item['object_uri_str'])
     dst_file = item['local_filename']
+
+    # is this actually a directory? skip it.
+    if os.path.isdir(dst_file):
+        return
+
     seq_label = "[%d of %d]" % (seq, total)
     try:
         dst_dir = os.path.dirname(dst_file)
