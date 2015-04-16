@@ -1,3 +1,18 @@
+Because s3cmd maintainers don't want to access and commit and pull requests, this repo exists.
+
+The goal here was to provide:
+
+* Ability to interact with Swift Object Storage Clusters
+* Ability to use multiple workers to sync/get/etc.. in parallel for extra speed
+* Ability to not check md5 hashes to verify files already existent in the destination
+
+This repo was forked from `brndnmtthws/s3cmd-modification` which was forked from another repo that added the parallization.
+
+
+
+ORIGINAL TEXT
+------------------------
+
 S3cmd tool for Amazon Simple Storage Service (S3)
 =================================================
 
